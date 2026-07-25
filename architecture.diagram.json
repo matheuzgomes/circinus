@@ -1,0 +1,179 @@
+{
+  "schema": 1,
+  "canvas": {
+    "background": "default"
+  },
+  "elements": [
+    {
+      "id": "store-frontend",
+      "kind": "box",
+      "x": 2,
+      "y": 2,
+      "w": 18,
+      "h": 5,
+      "label": "Store Frontend"
+    },
+    {
+      "id": "store-bff",
+      "kind": "box",
+      "shape": "gateway",
+      "x": 25,
+      "y": 2,
+      "w": 18,
+      "h": 5,
+      "label": "Store BFF"
+    },
+    {
+      "id": "store-api",
+      "kind": "box",
+      "x": 48,
+      "y": 2,
+      "w": 18,
+      "h": 5,
+      "label": "Store API"
+    },
+    {
+      "id": "orders-primary",
+      "kind": "box",
+      "shape": "database",
+      "x": 48,
+      "y": 12,
+      "w": 18,
+      "h": 10,
+      "label": "Primary DB"
+    },
+    {
+      "id": "orders-replica-1",
+      "kind": "box",
+      "shape": "database",
+      "x": 25,
+      "y": 25,
+      "w": 18,
+      "h": 10,
+      "label": "Read Replica 1"
+    },
+    {
+      "id": "orders-replica-2",
+      "kind": "box",
+      "shape": "database",
+      "x": 48,
+      "y": 25,
+      "w": 18,
+      "h": 10,
+      "label": "Read Replica 2"
+    },
+    {
+      "id": "payments-queue",
+      "kind": "box",
+      "shape": "queue",
+      "x": 25,
+      "y": 12,
+      "w": 18,
+      "h": 5,
+      "label": "RabbitMQ"
+    },
+    {
+      "id": "payment-worker",
+      "kind": "box",
+      "x": 2,
+      "y": 12,
+      "w": 18,
+      "h": 5,
+      "label": "Payment Worker"
+    },
+    {
+      "id": "stripe",
+      "kind": "box",
+      "shape": "gateway",
+      "x": 2,
+      "y": 25,
+      "w": 18,
+      "h": 5,
+      "label": "Stripe"
+    },
+    {
+      "id": "frontend-to-bff",
+      "kind": "arrow",
+      "from": "store-frontend",
+      "to": "store-bff",
+      "label": "HTTPS / Store API"
+    },
+    {
+      "id": "bff-to-api",
+      "kind": "arrow",
+      "from": "store-bff",
+      "to": "store-api",
+      "label": "REST / BFF"
+    },
+    {
+      "id": "api-to-primary",
+      "kind": "arrow",
+      "from": "store-api",
+      "to": "orders-primary",
+      "label": "orders and checkout"
+    },
+    {
+      "id": "api-to-rabbit",
+      "kind": "arrow",
+      "from": "store-api",
+      "to": "payments-queue",
+      "label": "publish PaymentRequested"
+    },
+    {
+      "id": "rabbit-to-worker",
+      "kind": "arrow",
+      "from": "payments-queue",
+      "to": "payment-worker",
+      "label": "consume payment job"
+    },
+    {
+      "id": "worker-to-stripe",
+      "kind": "arrow",
+      "from": "payment-worker",
+      "to": "stripe",
+      "label": "create PaymentIntent"
+    },
+    {
+      "id": "stripe-to-worker",
+      "kind": "arrow",
+      "from": "stripe",
+      "to": "payment-worker",
+      "label": "payment webhook"
+    },
+    {
+      "id": "worker-to-primary",
+      "kind": "arrow",
+      "from": "payment-worker",
+      "to": "orders-primary",
+      "label": "update payment status"
+    },
+    {
+      "id": "primary-to-replica-1",
+      "kind": "arrow",
+      "from": "orders-primary",
+      "to": "orders-replica-1",
+      "label": "stream replication"
+    },
+    {
+      "id": "primary-to-replica-2",
+      "kind": "arrow",
+      "from": "orders-primary",
+      "to": "orders-replica-2",
+      "label": "stream replication"
+    },
+    {
+      "id": "api-to-replica-1",
+      "kind": "arrow",
+      "from": "store-api",
+      "to": "orders-replica-1",
+      "label": "read-only catalog"
+    },
+    {
+      "id": "api-to-replica-2",
+      "kind": "arrow",
+      "from": "store-api",
+      "to": "orders-replica-2",
+      "label": "read-only orders"
+    }
+  ]
+}
