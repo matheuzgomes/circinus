@@ -92,8 +92,9 @@ func (e *Editor) insertRoutePoint() {
 	if e.selected < 0 || e.selected >= len(e.doc.Elements) || e.doc.Elements[e.selected].Kind != "arrow" {
 		return
 	}
-	route := e.planRelationRoutes()[e.selected]
-	if len(route.points) < 2 {
+	sc := e.ensureScene()
+	route, ok := sc.routes[e.selected]
+	if !ok || len(route.points) < 2 {
 		return
 	}
 	middle := route.points[len(route.points)/2]

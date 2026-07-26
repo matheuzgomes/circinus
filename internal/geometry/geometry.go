@@ -124,7 +124,9 @@ func RouteAroundBoxesAndPoints(start, end Point, obstacles []Box, blocked []Poin
 		minY = Min(minY, obstacle.Y-2)
 		maxY = Max(maxY, obstacle.Y+obstacle.H+1)
 	}
+	blockedSet := make(map[Point]bool, len(blocked))
 	for _, point := range blocked {
+		blockedSet[point] = true
 		minX = Min(minX, point.X-2)
 		maxX = Max(maxX, point.X+2)
 		minY = Min(minY, point.Y-2)
@@ -148,7 +150,10 @@ func RouteAroundBoxesAndPoints(start, end Point, obstacles []Box, blocked []Poin
 			if next.X < minX || next.X > maxX || next.Y < minY || next.Y > maxY {
 				continue
 			}
-			if _, seen := previous[next]; seen || (next != end && (BlockedByBox(next, obstacles) || ContainsPoint(blocked, next))) {
+			if _, seen := previous[next]; seen {
+				continue
+			}
+			if next != end && (BlockedByBox(next, obstacles) || blockedSet[next]) {
 				continue
 			}
 			previous[next] = current

@@ -12,7 +12,7 @@ func (e *Editor) handleMouse(event *tcell.EventMouse) {
 	buttons := event.Buttons()
 	e.hovered = e.hitElement(x, y)
 	if e.hovered < 0 {
-		e.hovered, _ = e.hitRouteSegment(x, y)
+		e.hovered = e.hitRouteSegmentFast(x, y)
 	}
 	if buttons&tcell.WheelUp != 0 {
 		e.changeZoom(1)
@@ -23,8 +23,17 @@ func (e *Editor) handleMouse(event *tcell.EventMouse) {
 		return
 	}
 	if buttons == tcell.ButtonNone {
+		wasDragging := e.dragging
+		wasConnect := e.dragKind == "connect"
+		if wasDragging {
+			e.invalidateSceneRoutes()
+			e.needsRedraw = true
+		}
 		e.dragging = false
 		e.dragKind = ""
+		if wasConnect && e.selected >= 0 && e.selected != e.connectFrom && e.doc.Elements[e.selected].Kind == "box" {
+			e.confirmConnection()
+		}
 		return
 	}
 	if buttons&tcell.Button1 == 0 {
@@ -39,6 +48,7 @@ func (e *Editor) handleMouse(event *tcell.EventMouse) {
 
 func (e *Editor) startMouseDrag(x, y int) {
 	e.lastMouseX, e.lastMouseY = x, y
+	e.dragAnchorX, e.dragAnchorY = x, y
 	if index, control := e.hitControlPoint(x, y); index >= 0 {
 		e.selected = index
 		e.routeMode = true
@@ -50,6 +60,20 @@ func (e *Editor) startMouseDrag(x, y int) {
 		e.dragControl = control
 		return
 	}
+	// check if click is on an edge handle of a hovered node
+	if e.hovered >= 0 && e.hovered < len(e.doc.Elements) && e.doc.Elements[e.hovered].Kind == "box" && e.zoom >= 50 {
+		el := e.doc.Elements[e.hovered]
+		nx, ny := e.canvasToScreen(el.X, el.Y)
+		w, h := e.scaledSize(el.W), e.scaledSize(el.H)
+		edgeKind := e.edgeHandleAt(x, y, nx, ny, w, h)
+		if edgeKind != "" {
+			e.startConnectionFrom(e.hovered, edgeKind)
+			e.dragging = true
+			e.dragKind = "connect"
+			e.dragElement = e.hovered
+			return
+		}
+	}
 	if index := e.hitElement(x, y); index >= 0 {
 		e.selected = index
 		if e.doc.Elements[index].Kind == "box" || e.doc.Elements[index].Kind == "annotation" {
@@ -57,6 +81,8 @@ func (e *Editor) startMouseDrag(x, y int) {
 			e.dragging = true
 			e.dragKind = "element"
 			e.dragElement = index
+			e.dragOriginX = e.doc.Elements[index].X
+			e.dragOriginY = e.doc.Elements[index].Y
 			sx, _ := e.canvasToScreen(e.doc.Elements[index].X, e.doc.Elements[index].Y)
 			width := e.scaledSize(e.doc.Elements[index].W)
 			if e.doc.Elements[index].Kind == "annotation" && x >= sx+width-1 {
@@ -94,7 +120,9 @@ func (e *Editor) updateMouseDrag(x, y int) {
 	}
 	switch e.dragKind {
 	case "element":
-		e.moveElementByScreenDelta(e.dragElement, dx, dy)
+		e.moveElementToScreen(e.dragElement, x, y)
+		// ponytail: provisional rendering in draw() uses cheap RoutePoints for incident arrows;
+		// full BFS RouteAroundBoxesAndPoints runs once on mouse-up when invalidateSceneRoutes fires.
 	case "annotation-resize":
 		e.resizeAnnotation(e.dragElement, dx)
 	case "pan":
@@ -104,26 +132,35 @@ func (e *Editor) updateMouseDrag(x, y int) {
 		}
 		e.viewportX -= dx * 100 / step
 		e.viewportY -= dy * 100 / step
+		e.invalidateSceneScreen()
 	case "control":
 		point := e.mouseCanvasPoint(x, y)
 		if e.dragControl >= 0 && e.dragControl < len(e.doc.Elements[e.dragElement].ControlPoints) {
 			e.doc.Elements[e.dragElement].ControlPoints[e.dragControl] = documentPoint(point)
 			e.dirty = true
 		}
+	case "connect":
+		if idx := e.hitElement(x, y); idx >= 0 && idx != e.connectFrom && e.doc.Elements[idx].Kind == "box" {
+			e.selected = idx
+		}
 	}
 	e.lastMouseX, e.lastMouseY = x, y
 }
 
-func (e *Editor) moveElementByScreenDelta(index, dx, dy int) {
+func (e *Editor) moveElementToScreen(index, screenX, screenY int) {
 	if index < 0 || index >= len(e.doc.Elements) || (e.doc.Elements[index].Kind != "box" && e.doc.Elements[index].Kind != "annotation") {
 		return
 	}
-	step := e.zoom
-	if step < 1 {
-		step = 1
+	// absolute: origin logical + (current mouse screen - anchor screen) converted to logical
+	// avoids cumulative integer-division rounding per frame
+	screenDX := screenX - e.dragAnchorX
+	screenDY := screenY - e.dragAnchorY
+	zoom := e.zoom
+	if zoom < 1 {
+		zoom = 1
 	}
-	e.doc.Elements[index].X += dx * 100 / step
-	e.doc.Elements[index].Y += dy * 100 / step
+	e.doc.Elements[index].X = e.dragOriginX + screenDX*100/zoom
+	e.doc.Elements[index].Y = e.dragOriginY + screenDY*100/zoom
 	e.dirty = true
 }
 
@@ -157,6 +194,18 @@ func (e *Editor) hitControlPoint(x, y int) (int, int) {
 	return -1, -1
 }
 
+func (e *Editor) hitRouteSegmentFast(x, y int) int {
+	sc := e.ensureScene()
+	if sc.hitMap == nil {
+		return -1
+	}
+	key := geometry.Point{X: x, Y: y}
+	if idx, ok := sc.hitMap[key]; ok {
+		return idx
+	}
+	return -1
+}
+
 func (e *Editor) hitRouteSegment(x, y int) (int, geometry.Point) {
 	for index, element := range e.doc.Elements {
 		if element.Kind != "arrow" {
@@ -183,4 +232,27 @@ func (e *Editor) mouseCanvasPoint(x, y int) geometry.Point {
 
 func documentPoint(point geometry.Point) document.Point {
 	return document.Point{X: point.X, Y: point.Y}
+}
+
+func (e *Editor) edgeHandleAt(mx, my, nx, ny, w, h int) string {
+	if mx == nx+w/2 && my == ny-1 {
+		return "top"
+	}
+	if mx == nx+w/2 && my == ny+h {
+		return "bottom"
+	}
+	if mx == nx-1 && my == ny+h/2 {
+		return "left"
+	}
+	if mx == nx+w && my == ny+h/2 {
+		return "right"
+	}
+	return ""
+}
+
+func (e *Editor) startConnectionFrom(index int, edge string) {
+	e.connectMode = true
+	e.connectFrom = index
+	e.selected = index
+	e.status = "connect from " + e.doc.Elements[index].ID + "; drag to target"
 }

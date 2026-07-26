@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"circinus/internal/document"
+	"circinus/internal/geometry"
 	"circinus/internal/screen"
 
 	"github.com/gdamore/tcell/v2"
@@ -38,9 +39,15 @@ type Editor struct {
 	dragKind    string
 	dragElement int
 	dragControl int
+	dragAnchorX int
+	dragAnchorY int
+	dragOriginX int
+	dragOriginY int
 	hovered     int
 	lastMouseX  int
 	lastMouseY  int
+	scene       *sceneCache
+	needsRedraw bool
 }
 
 func EditDocument(root, input string) error {
@@ -71,15 +78,32 @@ func EditDocument(root, input string) error {
 }
 
 func (e *Editor) loop() error {
+	needsDraw := true
+	lastHovered := -2
 	for {
-		e.draw()
+		if needsDraw {
+			e.draw()
+			needsDraw = false
+		}
 		event := e.screen.PollEvent()
 		switch event := event.(type) {
 		case *tcell.EventResize:
+			e.invalidateSceneScreen()
 			e.screen.Sync()
+			needsDraw = true
 		case *tcell.EventMouse:
+			beforeHovered := e.hovered
 			e.handleMouse(event)
+			if e.hovered != beforeHovered || e.dragging || e.dirty || e.needsRedraw {
+				needsDraw = true
+				e.needsRedraw = false
+			}
+			if lastHovered != e.hovered {
+				lastHovered = e.hovered
+				needsDraw = true
+			}
 		case *tcell.EventKey:
+			needsDraw = true
 			if done, err := e.handleKey(event); err != nil {
 				return err
 			} else if done {
@@ -132,13 +156,29 @@ func (e *Editor) handleKey(event *tcell.EventKey) (bool, error) {
 			e.selectNext()
 		}
 	case tcell.KeyUp:
-		e.moveSelected(0, -1)
+		if e.connectMode {
+			e.selectSpatialTarget(0, -1)
+		} else {
+			e.moveSelected(0, -1)
+		}
 	case tcell.KeyDown:
-		e.moveSelected(0, 1)
+		if e.connectMode {
+			e.selectSpatialTarget(0, 1)
+		} else {
+			e.moveSelected(0, 1)
+		}
 	case tcell.KeyLeft:
-		e.moveSelected(-1, 0)
+		if e.connectMode {
+			e.selectSpatialTarget(-1, 0)
+		} else {
+			e.moveSelected(-1, 0)
+		}
 	case tcell.KeyRight:
-		e.moveSelected(1, 0)
+		if e.connectMode {
+			e.selectSpatialTarget(1, 0)
+		} else {
+			e.moveSelected(1, 0)
+		}
 	case tcell.KeyEnter:
 		if e.connectMode {
 			e.confirmConnection()
@@ -204,6 +244,7 @@ func (e *Editor) quit() (bool, error) {
 func (e *Editor) checkpoint() {
 	e.history = append(e.history, cloneDocument(e.doc))
 	e.future = nil
+	e.invalidateSceneRoutes()
 }
 
 func cloneDocument(source document.Document) document.Document {
@@ -337,7 +378,35 @@ func (e *Editor) selectNextBox() {
 		return
 	}
 	e.selected = target
-	e.status = fmt.Sprintf("target %s; Enter confirms, Esc cancels", e.doc.Elements[target].ID)
+	e.status = fmt.Sprintf("target %s; Enter confirms, arrow keys pick nearest, Esc cancels", e.doc.Elements[target].ID)
+}
+
+func (e *Editor) selectSpatialTarget(dx, dy int) {
+	if !e.connectMode || e.connectFrom < 0 {
+		return
+	}
+	src := e.doc.Elements[e.connectFrom]
+	srcCX, srcCY := src.X+src.W/2, src.Y+src.H/2
+	best, bestDist := -1, 999999
+	for i, el := range e.doc.Elements {
+		if i == e.connectFrom || el.Kind != "box" {
+			continue
+		}
+		cx, cy := el.X+el.W/2, el.Y+el.H/2
+		// prefer elements in the direction of the arrow key
+		dd := (cx-srcCX)*dx + (cy-srcCY)*dy
+		if dd <= 0 {
+			continue
+		}
+		dist := geometry.Abs(cx-srcCX) + geometry.Abs(cy-srcCY)
+		if dist < bestDist {
+			best, bestDist = i, dist
+		}
+	}
+	if best >= 0 {
+		e.selected = best
+		e.status = fmt.Sprintf("target %s; Enter confirms, Esc cancels", e.doc.Elements[best].ID)
+	}
 }
 
 func (e *Editor) confirmConnection() {

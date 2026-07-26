@@ -12,6 +12,14 @@ import (
 	"github.com/gdamore/tcell/v2"
 )
 
+type arrowFocus int
+
+const (
+	focusOut arrowFocus = iota // arrow FROM selected node
+	focusIn                    // arrow TO selected node
+	focusDim                   // arrow not incident to selection
+)
+
 func (e *Editor) draw() {
 	e.screen.Clear()
 	w, h := e.screen.Size()
@@ -19,15 +27,37 @@ func (e *Editor) draw() {
 	statusStyle := tcell.StyleDefault.Foreground(tcell.ColorLightGreen).Background(tcell.ColorBlack)
 	e.screen.Fill(' ', tcell.StyleDefault.Background(tcell.ColorBlack))
 
-	routes := e.planRelationRoutes()
-	for i, element := range e.doc.Elements {
-		if element.Kind == "arrow" {
-			e.drawArrowPath(element, i == e.selected || i == e.hovered, routes[i])
+	sc := e.ensureScene()
+	routes := sc.routes
+	if e.dragging && e.dragKind == "element" && e.dragElement >= 0 {
+		routes = e.provisionalRoutes(sc, e.dragElement)
+	}
+	// build focus map: per-arrow classification relative to selection
+	focus := e.arrowFocusMap(sc)
+	// draw dim arrows first (background), then incoming, then outgoing (on top)
+	for _, pass := range []arrowFocus{focusDim, focusIn, focusOut} {
+		for i, element := range e.doc.Elements {
+			if element.Kind != "arrow" {
+				continue
+			}
+			if focus[i] != pass {
+				continue
+			}
+			isSel := i == e.selected || i == e.hovered
+			e.drawArrowPath(element, isSel, routes[i], focus[i])
 		}
 	}
-	for i, element := range e.doc.Elements {
-		if element.Kind == "arrow" {
-			e.drawArrowLabel(element, i == e.selected || i == e.hovered, routes[i])
+	// labels follow same pass order but all draws happen after all paths
+	for _, pass := range []arrowFocus{focusDim, focusIn, focusOut} {
+		for i, element := range e.doc.Elements {
+			if element.Kind != "arrow" {
+				continue
+			}
+			if focus[i] != pass {
+				continue
+			}
+			isSel := i == e.selected || i == e.hovered
+			e.drawArrowLabel(element, isSel, routes[i], focus[i])
 		}
 	}
 	for i, element := range e.doc.Elements {
@@ -38,17 +68,34 @@ func (e *Editor) draw() {
 			e.drawAnnotation(element, i == e.selected || i == e.hovered)
 		}
 	}
+	e.drawConnectionPreview()
 
 	e.screen.PutStrStyled(0, 0, fmt.Sprintf(" Circinus  %s ", filepath.Base(e.path)), titleStyle)
 	e.drawDetails(w, h)
 	e.screen.PutStrStyled(0, h-2, fit(" "+e.status, w), statusStyle)
-	e.screen.PutStrStyled(0, h-1, fit(" b node  n annotation  a relation  m route  x delete  Tab select  e edit  r ref  h/j/k/l move  +/- zoom  0 fit  u undo  Ctrl-r redo  Ctrl-s save  q quit", w), statusStyle)
+	modeBar := ""
+	if e.connectMode {
+		tgtID := "?"
+		if e.selected >= 0 && e.selected < len(e.doc.Elements) && e.selected != e.connectFrom && e.doc.Elements[e.selected].Kind == "box" {
+			tgtID = e.doc.Elements[e.selected].ID
+		}
+		srcID := "?"
+		if e.connectFrom >= 0 && e.connectFrom < len(e.doc.Elements) {
+			srcID = e.doc.Elements[e.connectFrom].ID
+		}
+		modeBar = fmt.Sprintf(" CONNECT: %s → %s | arrows/Tab: target  Enter: confirm  Esc: cancel ", srcID, tgtID)
+	} else if e.routeMode {
+		modeBar = " ROUTE: Tab: point  arrows/hjkl: move  Enter: add  Delete: remove  r: reset  Esc: done "
+	} else {
+		modeBar = " b node  n annotation  a relation  m route  x delete  Tab select  e edit  r ref  h/j/k/l move  +/- zoom  0 fit  u undo  Ctrl-r redo  Ctrl-s save  q quit "
+	}
+	e.screen.PutStrStyled(0, h-1, fit(modeBar, w), statusStyle)
 	e.screen.Show()
 }
 
 func (e *Editor) drawDetails(width, height int) {
 	style := tcell.StyleDefault.Foreground(tcell.ColorLightCyan).Background(tcell.ColorBlack)
-	start := height - 5
+	start := height - 6
 	if start < 1 {
 		return
 	}
@@ -61,10 +108,12 @@ func (e *Editor) drawDetails(width, height int) {
 	element := e.doc.Elements[e.selected]
 	lines := []string{}
 	if element.Kind == "box" {
+		out, in := e.incidentCounts(element.ID)
 		lines = []string{
-			fmt.Sprintf(" node %s", element.ID),
-			fmt.Sprintf(" label: %s", displayValue(element.Label)),
-			fmt.Sprintf(" ref: %s", formatReference(element.Ref)),
+			fmt.Sprintf(" %s  ▲%d  ▼%d", element.ID, out, in),
+			" " + e.relationList(element.ID, true, width-1),
+			" " + e.relationList(element.ID, false, width-1),
+			fmt.Sprintf(" label: %s  ref: %s", displayValue(element.Label), formatReference(element.Ref)),
 		}
 	} else if element.Kind == "annotation" {
 		lines = []string{
@@ -363,11 +412,18 @@ func (e *Editor) relationEdges(index int, from, to document.Element) (geometry.P
 	toBox := geometry.Box{X: to.X, Y: to.Y, W: to.W, H: to.H}
 	fromCenter := geometry.Point{X: from.X + from.W/2, Y: from.Y + from.H/2}
 	toCenter := geometry.Point{X: to.X + to.W/2, Y: to.Y + to.H/2}
-	fromPort, toPort := relationPorts(from, to)
-	pairOffset := relationPairLane(e.doc.Elements, index)
-	fromOffset := pairOffset + e.nodePortOffset(index, fromPort)
-	toOffset := pairOffset + e.nodePortOffset(index, toPort)
-	return geometry.ArrowEdgesWithOffsets(fromBox, toBox, fromCenter, toCenter, fromOffset, toOffset)
+	fromOffset, toOffset := 0, 0
+	if e.scene != nil && e.scene.portOffsets != nil {
+		fromOffset = e.scene.portOffsets[index]
+		toOffset = e.scene.portOffsets[index]
+	} else {
+		fromPort, toPort := relationPorts(from, to)
+		pairOffset := relationPairLane(e.doc.Elements, index)
+		fromOffset = pairOffset + e.nodePortOffset(index, fromPort)
+		toOffset = pairOffset + e.nodePortOffset(index, toPort)
+	}
+	start, end := geometry.ArrowEdgesWithOffsets(fromBox, toBox, fromCenter, toCenter, fromOffset, toOffset)
+	return start, end
 }
 
 func (e *Editor) drawAnnotation(element document.Element, selected bool) {
@@ -418,6 +474,31 @@ func (e *Editor) planRelationRoutes() map[int]relationRoute {
 	return routes
 }
 
+// ponytail: cheap orthogonal routes for incident arrows during drag;
+// full BFS obstacle avoidance deferred to mouse-up.
+func (e *Editor) provisionalRoutes(sc *sceneCache, dragIdx int) map[int]relationRoute {
+	dragID := e.doc.Elements[dragIdx].ID
+	routes := make(map[int]relationRoute, len(sc.routes))
+	for i, cached := range sc.routes {
+		el := e.doc.Elements[i]
+		if el.Kind != "arrow" {
+			continue
+		}
+		if el.From == dragID || el.To == dragID {
+			from, to, err := e.doc.RelationNodes(el)
+			if err != nil {
+				routes[i] = cached
+				continue
+			}
+			start, end := e.relationEdges(i, from, to)
+			routes[i] = relationRoute{points: geometry.RoutePoints(start, end)}
+			continue
+		}
+		routes[i] = cached
+	}
+	return routes
+}
+
 func routeBoxes(relation document.Element, elements []document.Element) []geometry.Box {
 	boxes := make([]geometry.Box, 0)
 	for _, element := range elements {
@@ -428,12 +509,12 @@ func routeBoxes(relation document.Element, elements []document.Element) []geomet
 	return boxes
 }
 
-func (e *Editor) drawArrowPath(element document.Element, selected bool, route relationRoute) {
+func (e *Editor) drawArrowPath(element document.Element, selected bool, route relationRoute, focus arrowFocus) {
 	if len(route.points) == 0 {
 		return
 	}
 	points := e.screenRoutePoints(route.points)
-	style := e.arrowStyle(element, selected, route.warning)
+	style := e.arrowStyle(element, selected, route.warning, focus)
 	for i, current := range points {
 		glyph := '\u00B7'
 		if i > 0 && points[i-1].X == current.X {
@@ -443,6 +524,10 @@ func (e *Editor) drawArrowPath(element document.Element, selected bool, route re
 			glyph = '\u2500'
 		}
 		e.screen.SetContent(current.X, current.Y, glyph, nil, style)
+	}
+	// ponytail: ● at source for outgoing arrows — direction readable without relying on color alone
+	if focus == focusOut && len(points) >= 2 {
+		e.screen.SetContent(points[0].X, points[0].Y, '\u25CF', nil, style)
 	}
 	if len(points) > 1 {
 		previous, current := points[len(points)-2], points[len(points)-1]
@@ -474,14 +559,14 @@ func (e *Editor) drawArrowPath(element document.Element, selected bool, route re
 	}
 }
 
-func (e *Editor) drawArrowLabel(element document.Element, selected bool, route relationRoute) {
+func (e *Editor) drawArrowLabel(element document.Element, selected bool, route relationRoute, focus arrowFocus) {
 	if len(route.points) == 0 || element.Label == "" || (e.zoom < 50 && !selected) {
 		return
 	}
 	points := e.screenRoutePoints(route.points)
 	placement := geometry.PlaceLabel(points, element.Label)
 	if placement.Width > 0 {
-		e.screen.PutStrStyled(placement.X, placement.Y, truncate(element.Label, placement.Width), e.arrowStyle(element, selected, route.warning))
+		e.screen.PutStrStyled(placement.X, placement.Y, truncate(element.Label, placement.Width), e.arrowStyle(element, selected, route.warning, focus))
 	}
 }
 
@@ -510,8 +595,73 @@ func (e *Editor) screenRoutePoints(points []geometry.Point) []geometry.Point {
 	return result
 }
 
-func (e *Editor) arrowStyle(element document.Element, selected, warning bool) tcell.Style {
-	style := tcell.StyleDefault.Foreground(tcell.ColorLightBlue)
+func (e *Editor) drawConnectionPreview() {
+	if e.connectFrom < 0 || e.connectFrom >= len(e.doc.Elements) || e.doc.Elements[e.connectFrom].Kind != "box" {
+		return
+	}
+	src := e.doc.Elements[e.connectFrom]
+	style := tcell.StyleDefault.Foreground(tcell.ColorYellow).Bold(true)
+	srcEdgeX, srcEdgeY := e.canvasToScreen(src.X+src.W, src.Y+src.H/2)
+	e.screen.SetContent(srcEdgeX, srcEdgeY, '●', nil, style)
+
+	if e.connectMode && e.selected >= 0 && e.selected < len(e.doc.Elements) && e.doc.Elements[e.selected].Kind == "box" && e.selected != e.connectFrom {
+		tgt := e.doc.Elements[e.selected]
+		startEdge, endEdge := e.previewEdges(src, tgt)
+		pts := geometry.RoutePoints(startEdge, endEdge)
+		for _, pt := range pts {
+			scrX, scrY := e.canvasToScreen(pt.X, pt.Y)
+			e.screen.SetContent(scrX, scrY, '·', nil, style)
+		}
+		tgtEdgeX, tgtEdgeY := e.canvasToScreen(tgt.X-1, tgt.Y+tgt.H/2)
+		if endEdge.X < tgt.X+tgt.W/2 {
+			tgtEdgeX, tgtEdgeY = e.canvasToScreen(tgt.X+tgt.W, tgt.Y+tgt.H/2)
+		} else if endEdge.Y > tgt.Y+tgt.H/2 {
+			tgtEdgeX, tgtEdgeY = e.canvasToScreen(tgt.X+tgt.W/2, tgt.Y-1)
+		} else if endEdge.Y < tgt.Y+tgt.H/2 {
+			tgtEdgeX, tgtEdgeY = e.canvasToScreen(tgt.X+tgt.W/2, tgt.Y+tgt.H)
+		}
+		e.screen.SetContent(tgtEdgeX, tgtEdgeY, '●', nil, style)
+	}
+	if !e.connectMode {
+		for i, el := range e.doc.Elements {
+			if el.Kind != "box" {
+				continue
+			}
+			if i != e.hovered && i != e.selected {
+				continue
+			}
+			if e.zoom < 50 {
+				continue
+			}
+			nx, ny := e.canvasToScreen(el.X, el.Y)
+			w, h := e.scaledSize(el.W), e.scaledSize(el.H)
+			handleStyle := tcell.StyleDefault.Foreground(tcell.ColorLightCyan)
+			e.screen.SetContent(nx+w/2, ny-1, '╥', nil, handleStyle)
+			e.screen.SetContent(nx+w/2, ny+h, '╨', nil, handleStyle)
+			e.screen.SetContent(nx-1, ny+h/2, '╡', nil, handleStyle)
+			e.screen.SetContent(nx+w, ny+h/2, '╞', nil, handleStyle)
+		}
+	}
+}
+
+func (e *Editor) previewEdges(src, tgt document.Element) (geometry.Point, geometry.Point) {
+	srcBox := geometry.Box{X: src.X, Y: src.Y, W: src.W, H: src.H}
+	tgtBox := geometry.Box{X: tgt.X, Y: tgt.Y, W: tgt.W, H: tgt.H}
+	srcCenter := geometry.Point{X: src.X + src.W/2, Y: src.Y + src.H/2}
+	tgtCenter := geometry.Point{X: tgt.X + tgt.W/2, Y: tgt.Y + tgt.H/2}
+	return geometry.ArrowEdges(srcBox, tgtBox, srcCenter, tgtCenter)
+}
+
+func (e *Editor) arrowStyle(element document.Element, selected, warning bool, focus arrowFocus) tcell.Style {
+	style := tcell.StyleDefault
+	switch focus {
+	case focusOut:
+		style = style.Foreground(tcell.ColorLightGreen)
+	case focusIn:
+		style = style.Foreground(tcell.ColorLightCyan)
+	default:
+		style = style.Foreground(tcell.ColorDarkGray)
+	}
 	if e.referenceBroken(element) || warning {
 		style = style.Foreground(tcell.ColorRed)
 	}
@@ -521,8 +671,101 @@ func (e *Editor) arrowStyle(element document.Element, selected, warning bool) tc
 	return style
 }
 
+// arrowFocusMap classifies each arrow relative to the currently selected node.
+// When an arrow is selected, its source and target become the focus anchors.
+func (e *Editor) arrowFocusMap(sc *sceneCache) map[int]arrowFocus {
+	focus := make(map[int]arrowFocus, len(e.doc.Elements))
+	focusNode := ""
+	if e.selected >= 0 && e.selected < len(e.doc.Elements) {
+		el := e.doc.Elements[e.selected]
+		if el.Kind == "box" {
+			focusNode = el.ID
+		} else if el.Kind == "arrow" {
+			// when arrow is selected, highlight its endpoints too
+			for i, el := range e.doc.Elements {
+				if el.Kind != "arrow" {
+					continue
+				}
+				if i == e.selected {
+					focus[i] = focusOut
+				} else if el.From == focusNode || el.To == focusNode {
+					focus[i] = focusIn
+				} else {
+					focus[i] = focusDim
+				}
+			}
+			return focus
+		}
+	}
+	if focusNode == "" {
+		for i, el := range e.doc.Elements {
+			if el.Kind == "arrow" {
+				focus[i] = focusOut // all look same when nothing selected
+			}
+		}
+		return focus
+	}
+	for i, el := range e.doc.Elements {
+		if el.Kind != "arrow" {
+			continue
+		}
+		if el.From == focusNode {
+			focus[i] = focusOut
+		} else if el.To == focusNode {
+			focus[i] = focusIn
+		} else {
+			focus[i] = focusDim
+		}
+	}
+	return focus
+}
+
 func (e *Editor) referenceBroken(element document.Element) bool {
 	return element.Ref != nil && document.ValidateReference(e.root, *element.Ref) != nil
+}
+
+func (e *Editor) incidentCounts(nodeID string) (out, in int) {
+	for _, el := range e.doc.Elements {
+		if el.Kind == "arrow" {
+			if el.From == nodeID {
+				out++
+			} else if el.To == nodeID {
+				in++
+			}
+		}
+	}
+	return
+}
+
+// ponytail: compact relation list in the detail panel shows full labels even when truncated on canvas.
+func (e *Editor) relationList(nodeID string, outgoing bool, maxWidth int) string {
+	prefix := "← "
+	if outgoing {
+		prefix = "→ "
+	}
+	parts := []string{}
+	for _, el := range e.doc.Elements {
+		if el.Kind != "arrow" {
+			continue
+		}
+		var otherID string
+		if outgoing && el.From == nodeID {
+			otherID = el.To
+		} else if !outgoing && el.To == nodeID {
+			otherID = el.From
+		} else {
+			continue
+		}
+		label := el.Label
+		if label == "" {
+			label = "—"
+		}
+		parts = append(parts, fmt.Sprintf("%s(%s)", otherID, label))
+	}
+	if len(parts) == 0 {
+		return prefix + "—"
+	}
+	return prefix + strings.Join(parts, " ")
 }
 
 func (e *Editor) nodeOverlaps(node document.Element) bool {

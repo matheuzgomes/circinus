@@ -62,6 +62,7 @@ func (e *Editor) changeZoom(direction int) {
 	oldScreenY := (focusY - e.viewportY) * oldZoom / 100
 	e.viewportX = focusX - oldScreenX*100/e.zoom
 	e.viewportY = focusY - oldScreenY*100/e.zoom
+	e.invalidateSceneScreen()
 	e.status = "zoom " + zoomText(e.zoom)
 }
 
